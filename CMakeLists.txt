@@ -15,3 +15,4 @@ find_package(CUDAToolkit REQUIRED)
 # Only include reproduced examples under ml-course.
 add_subdirectory(course2)
 add_subdirectory(course3)
+add_subdirectory(course4)
