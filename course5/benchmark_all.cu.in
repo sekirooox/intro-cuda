@@ -1,0 +1,140 @@
+// Filled by benchmark_all.py before compilation.
+#include "kernels.cuh"
+#include <cublas_v2.h>
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <stdexcept>
+#include <vector>
+
+const int custom_count = @COUNT@;
+const char *names[] = {@NAMES@};
+void ck(cudaError_t e) {
+  if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
+}
+void cb(cublasStatus_t e) {
+  if (e != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cuBLAS error " + std::to_string(int(e)));
+}
+void launch(int version, int M, int N, int K, cublasHandle_t handle, float *A, float *B, float *C) {
+  switch (version) {
+    @LAUNCHES@
+    default: {
+      float alpha = 1, beta = 0;
+      cb(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, N, A, K, &beta, C, N));
+    }
+  }
+  ck(cudaGetLastError());
+}
+template <class T> void resource(std::ofstream &f, const char *name, T fn, int threads) {
+  cudaFuncAttributes a;
+  int blocks;
+  ck(cudaFuncGetAttributes(&a, fn));
+  ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, fn, threads, 0));
+  f << name << ',' << threads << ',' << a.numRegs << ',' << a.localSizeBytes << ','
+    << a.sharedSizeBytes << ',' << blocks << '\n';
+}
+int main() {
+  try {
+    ck(cudaSetDevice(@DEVICE@));
+    cudaDeviceProp prop;
+    ck(cudaGetDeviceProperties(&prop, @DEVICE@));
+    std::ofstream env("environment.txt"), res("resources.csv"), correct("correctness.csv"), runs("all_runs.csv"), summary("performance.csv");
+    env << "GPU=" << prop.name << "\nCC=" << prop.major << '.' << prop.minor
+        << "\nRegistersPerSM=" << prop.regsPerMultiprocessor
+        << "\ncompile=-g -std=c++14 compute_52/sm_52\nalpha=1 beta=0; FP32 row-major; C=M*N\n"
+        << "cuBLAS=CUBLAS_PEDANTIC_MATH; seed=20261118; uniform[-1,1]\n"
+        << "warmup=3 per version; timed rounds=5 rotated order; repetitions=clamp(ceil(20ms/calibration),1,30)\n"
+        << "Only launches timed; FLOPs=2*M*N*K; atol=1e-3 rtol=1e-4\n";
+    res << "Version,Threads,Registers,LocalBytes,SharedBytes,BlocksPerSM\n";
+    @RESOURCES@
+    res.flush();
+    correct << "Version,M,N,K,Elements,Nonfinite,Mismatches,MaxAbsError,RMSError,Matched\n";
+    runs << "Version,M,N,K,Round,Repetitions,Milliseconds,TFLOPS\n";
+    summary << "Version,M,N,K,C_Rows,C_Cols,Median_ms,TFLOPS,Min_ms,Max_ms,Repetitions\n";
+    cublasHandle_t handle;
+    cb(cublasCreate(&handle));
+    cb(cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH));
+    cudaEvent_t start, stop;
+    ck(cudaEventCreate(&start));
+    ck(cudaEventCreate(&stop));
+    bool allmatch = true;
+    for (int N : {128, 256, 512, 1024, 2048, 4096, 8192}) {
+      int M = N, K = N;
+      size_t count = size_t(N) * N, bytes = count * sizeof(float);
+      std::vector<float> a(count), b(count), reference(count), output(count);
+      std::mt19937 gen(20261118);
+      std::uniform_real_distribution<float> dist(-1, 1);
+      for (auto &v : a) v = dist(gen);
+      for (auto &v : b) v = dist(gen);
+      float *A, *B, *C;
+      ck(cudaMalloc(&A, bytes)); ck(cudaMalloc(&B, bytes)); ck(cudaMalloc(&C, bytes));
+      ck(cudaMemcpy(A, a.data(), bytes, cudaMemcpyHostToDevice));
+      ck(cudaMemcpy(B, b.data(), bytes, cudaMemcpyHostToDevice));
+      ck(cudaMemset(C, 0, bytes));
+      launch(custom_count, M, N, K, handle, A, B, C);
+      ck(cudaMemcpy(reference.data(), C, bytes, cudaMemcpyDeviceToHost));
+      double sample_error = 0;
+      for (int s = 0; s < 16; ++s) {
+        int y = (s * 127 + 19) % N, x = (s * 293 + 31) % N;
+        double sum = 0;
+        for (int k = 0; k < K; ++k) sum += double(a[size_t(y) * K + k]) * b[size_t(k) * N + x];
+        sample_error = std::max(sample_error, std::abs(sum - reference[size_t(y) * N + x]));
+      }
+      env << "CPU_double_sample_max_abs N=" << N << ':' << sample_error << '\n'; env.flush();
+      for (int v = 0; v < custom_count; ++v) {
+        ck(cudaMemset(C, 0, bytes));
+        launch(v, M, N, K, handle, A, B, C);
+        ck(cudaMemcpy(output.data(), C, bytes, cudaMemcpyDeviceToHost));
+        size_t bad = 0, nonfinite = 0;
+        double maxabs = 0, squared = 0;
+        for (size_t i = 0; i < count; ++i) {
+          if (!std::isfinite(output[i]) || !std::isfinite(reference[i])) { ++bad; ++nonfinite; continue; }
+          double d = std::abs(double(output[i]) - reference[i]);
+          maxabs = std::max(maxabs, d); squared += d * d;
+          if (d > 1e-3 + 1e-4 * std::abs(double(reference[i]))) ++bad;
+        }
+        correct << std::setprecision(10) << names[v] << ',' << M << ',' << N << ',' << K << ',' << count << ','
+                << nonfinite << ',' << bad << ',' << maxabs << ',' << std::sqrt(squared / count) << ',' << (bad == 0) << '\n';
+        correct.flush(); allmatch &= bad == 0;
+        std::cout << names[v] << " N=" << N << " mismatches=" << bad << std::endl;
+      }
+      auto measure = [&](int version, int repetitions) {
+        ck(cudaEventRecord(start));
+        for (int i = 0; i < repetitions; ++i) launch(version, M, N, K, handle, A, B, C);
+        ck(cudaEventRecord(stop)); ck(cudaEventSynchronize(stop));
+        float elapsed; ck(cudaEventElapsedTime(&elapsed, start, stop));
+        return double(elapsed) / repetitions;
+      };
+      std::vector<int> repetitions(custom_count + 1);
+      std::vector<std::vector<double>> times(custom_count + 1);
+      for (int v = 0; v <= custom_count; ++v) {
+        for (int i = 0; i < 3; ++i) launch(v, M, N, K, handle, A, B, C);
+        ck(cudaDeviceSynchronize());
+        double ms = measure(v, 1);
+        repetitions[v] = std::max(1, std::min(30, int(std::ceil(20 / ms))));
+      }
+      for (int round = 0; round < 5; ++round) {
+        for (int j = 0; j <= custom_count; ++j) {
+          int v = (j + round * 4) % (custom_count + 1);
+          double ms = measure(v, repetitions[v]); times[v].push_back(ms);
+          runs << std::setprecision(10) << names[v] << ',' << M << ',' << N << ',' << K << ',' << round + 1 << ','
+               << repetitions[v] << ',' << ms << ',' << 2.0 * M * N * K / (ms * 1e9) << '\n'; runs.flush();
+        }
+        std::cout << "N=" << N << " round=" << round + 1 << " done" << std::endl;
+      }
+      for (int v = 0; v <= custom_count; ++v) {
+        std::sort(times[v].begin(), times[v].end()); double ms = times[v][2];
+        summary << std::setprecision(10) << names[v] << ',' << M << ',' << N << ',' << K << ',' << M << ',' << N << ','
+                << ms << ',' << 2.0 * M * N * K / (ms * 1e9) << ',' << times[v].front() << ',' << times[v].back() << ',' << repetitions[v] << '\n';
+        summary.flush();
+        std::cout << names[v] << " N=" << N << " TFLOPS=" << 2.0 * M * N * K / (ms * 1e9) << std::endl;
+      }
+      ck(cudaFree(A)); ck(cudaFree(B)); ck(cudaFree(C));
+    }
+    ck(cudaEventDestroy(start)); ck(cudaEventDestroy(stop)); cb(cublasDestroy(handle));
+    return allmatch ? 0 : 2;
+  } catch (const std::exception &e) { std::cerr << e.what() << std::endl; return 1; }
+}

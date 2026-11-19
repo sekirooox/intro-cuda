@@ -46,12 +46,31 @@ __global__ void mysgemm_v1(int M, int N, int K, float alpha, float *A, float *B,
   C[i * N + j] = beta * C[i * N + j] + alpha * tmp;
 }
 
+__global__ void mysgemm_v1_r(int M, int N, int K, float alpha, float *A, float *B,
+                           float beta, float *C)
+{
+  int i = blockIdx.y * blockDim.y + threadIdx.y; // Row index
+  int j = blockIdx.x * blockDim.x + threadIdx.x; // Column index
+
+  float tmp = 0.0f;
+  #pragma unroll
+  for (int k = 0; k < K; k++)
+  {
+    if (i < M && j < N)
+    {
+      tmp += alpha * A[i * K + k] * B[k * N + j];
+    }
+  }
+  // C= alpha*AB + beta*C
+  C[i * N + j] = beta * C[i * N + j] + alpha * tmp;
+}
+
 int main()
 {
   std::vector<int> sizes = {128, 256, 512, 1024, 2048, 4096, 8192};
 
   // 打开CSV文件
-  std::ofstream csv_file("sgemm_benchmark_v1.csv");
+  std::ofstream csv_file("sgemm_benchmark_v1-base_r.csv");
   csv_file << "Size,CUBLAS_GFLOPS,MySGEMM_FLOPS,Matched" << std::endl;
 
   for (int N : sizes)
@@ -140,7 +159,7 @@ int main()
 
       for (int i = 0; i < warpup_time; ++i)
       {
-        mysgemm_v1<<<blocks, threads>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v1);
+        mysgemm_v1_r<<<blocks, threads>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v1);
       }
       cudaDeviceSynchronize();
 
@@ -148,7 +167,7 @@ int main()
                      "cudaEventRecord(start v1) failed");
       for (int i = 0; i < repeat_time; ++i)
       {
-        mysgemm_v1<<<blocks, threads>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v1);
+        mysgemm_v1_r<<<blocks, threads>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v1);
       }
       checkCudaError(cudaEventRecord(stop), "cudaEventRecord(stop v1) failed");
       checkCudaError(cudaEventSynchronize(stop),

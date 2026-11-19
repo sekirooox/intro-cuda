@@ -26,6 +26,7 @@ void checkCublasError(cublasStatus_t status, const char *msg)
   }
 }
 
+// 假设：一个线程负责一个元素，且一一对应
 template <const int BLOCK_SIZE>
 __global__ void mysgemm_v2(int M, int N, int K, float alpha, float *A, float *B,
                            float beta, float *C)
@@ -44,7 +45,6 @@ __global__ void mysgemm_v2(int M, int N, int K, float alpha, float *A, float *B,
   __shared__ float SA[BM][BK];
   __shared__ float SB[BK][BN];
 
-  // 定义分块大小：注意，子矩阵维度默认一致
   float subval = 0.0f;
 
   // 全局2D坐标
@@ -60,7 +60,7 @@ __global__ void mysgemm_v2(int M, int N, int K, float alpha, float *A, float *B,
     // SA[ty][tx] = A[gy][tx+offset]; // 2D坐标
     if (gy < M && tx + offset < K)
     {
-    SA[ty][tx] = A[gy * K + tx + offset];
+      SA[ty][tx] = A[gy * K + tx + offset];
     }
     else
     {
@@ -69,7 +69,7 @@ __global__ void mysgemm_v2(int M, int N, int K, float alpha, float *A, float *B,
     // SB[ty][tx] = B[ty+offset][gx]; // 2D坐标
     if (ty + offset < K && gx < N)
     {
-    SB[ty][tx] = B[(ty + offset) * N + gx];
+      SB[ty][tx] = B[(ty + offset) * N + gx];
     }
     else
     {
@@ -89,7 +89,74 @@ __global__ void mysgemm_v2(int M, int N, int K, float alpha, float *A, float *B,
   // 写入全局
   if (gy < M && gx < N)
   {
-  C[gy * N + gx] = alpha * subval + beta * C[gy * N + gx];
+    C[gy * N + gx] = alpha * subval + beta * C[gy * N + gx];
+  }
+}
+
+template <const int BLOCK_SIZE>
+__global__ void mysgemm_v2_r(int M, int N, int K, float alpha, float *A, float *B,
+                           float beta, float *C)
+{
+  // block为单位的2D坐标
+  int bx = blockIdx.x;
+  int by = blockIdx.y;
+  // thread单位的block内2D坐标
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+
+  // 同一个block共享一个内存
+  constexpr int BM = BLOCK_SIZE;
+  constexpr int BN = BLOCK_SIZE;
+  constexpr int BK = BLOCK_SIZE;
+  __shared__ float SA[BM][BK];
+  __shared__ float SB[BK][BN];
+
+  float subval = 0.0f;
+
+  // 全局2D坐标
+  int gy = ty + by * BM;
+  int gx = tx + bx * BN; // 偏移
+
+  // 对于每一个分块，都进行局部的矩阵乘法
+  // 坐标偏移量为offset，分别表示多个子矩阵
+  for (int offset = 0; offset < K; offset += BK)
+  {
+    // 搬运到共享内存
+
+    // SA[ty][tx] = A[gy][tx+offset]; // 2D坐标
+    if (gy < M && tx + offset < K)
+    {
+      SA[ty][tx] = A[gy * K + tx + offset];
+    }
+    else
+    {
+      SA[ty][tx] = 0.0f;
+    }
+    // SB[ty][tx] = B[ty+offset][gx]; // 2D坐标
+    if (ty + offset < K && gx < N)
+    {
+      SB[ty][tx] = B[(ty + offset) * N + gx];
+    }
+    else
+    {
+      SB[ty][tx] = 0.0f;
+    }
+    __syncthreads();
+
+    // 计算局部矩阵乘法
+    #pragma unroll
+    for (int k = 0; k < BK; k++)
+    {
+      subval += SA[ty][k] * SB[k][tx];
+    }
+    __syncthreads();
+
+    // 累加多个局部值
+  }
+  // 写入全局
+  if (gy < M && gx < N)
+  {
+    C[gy * N + gx] = alpha * subval + beta * C[gy * N + gx];
   }
 }
 #define CEIL_DIV(M, N) ((M) + (N) - 1) / (N)
@@ -98,7 +165,7 @@ int main()
   std::vector<int> sizes = {1024};
 
   // 打开CSV文件
-  std::ofstream csv_file("sgemm_benchmark_v2.csv");
+  std::ofstream csv_file("sgemm_benchmark_v2-Tile_r.csv");
   csv_file << "Size,CUBLAS_GFLOPS,MySGEMM_FLOPS,Matched" << std::endl;
 
   for (int N : sizes)
@@ -186,7 +253,7 @@ int main()
 
       for (int i = 0; i < warpup_time; ++i)
       {
-        mysgemm_v2<32>
+        mysgemm_v2_r<32>
             <<<gridDim, blockDim>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v1);
       }
 
@@ -198,7 +265,7 @@ int main()
 
       for (int i = 0; i < repeat_time; ++i)
       {
-        mysgemm_v2<32>
+        mysgemm_v2_r<32>
             <<<gridDim, blockDim>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v1);
       }
       checkCudaError(cudaEventRecord(stop), "cudaEventRecord(stop v1) failed");
